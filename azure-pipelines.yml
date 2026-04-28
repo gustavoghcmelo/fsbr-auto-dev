@@ -1,0 +1,170 @@
+trigger:
+  - main
+  - homolog
+  - development
+
+pr: none
+
+pool:
+  name: $(poolName)
+
+variables:
+  - group: DeploymentVariables
+
+  - name: env
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: prod
+    ${{ elseif eq(variables['Build.SourceBranchName'], 'homolog') }}:
+      value: hml
+    ${{ else }}:
+      value: dev
+
+  - name: profile
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: prod
+    ${{ elseif eq(variables['Build.SourceBranchName'], 'homolog') }}:
+      value: homo
+    ${{ else }}:
+      value: dev
+
+  - name: NAMESPACE
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: production
+    ${{ elseif eq(variables['Build.SourceBranchName'], 'homolog') }}:
+      value: homolog
+    ${{ else }}:
+      value: development
+
+  - name: APP_SLUG
+    value: fsbr-auto-dev
+  - name: DOMAIN
+    value: fsbr--auto-dev
+
+resources:
+  repositories:
+    - repository: DevOps_CI
+      type: git
+      name: "DevOpsFSBR/DevOps_CI"
+
+jobs:
+  - job: QualityChecks
+    displayName: 'Pint + PHPStan + Pest'
+    steps:
+      - script: |
+          if [ -d "$(Build.SourcesDirectory)" ]; then
+            docker run --rm -v "$(Build.SourcesDirectory):/workspace" alpine sh -c "rm -rf /workspace/*  /workspace/.*" 2>/dev/null || true
+          fi
+        displayName: 'Clean workspace (fix root-owned files)'
+
+      - checkout: self
+
+      - script: |
+          HOST_UID=$(id -u)
+          HOST_GID=$(id -g)
+          docker run --rm -v "$(pwd):/app" -w /app php:8.3-cli bash -c "
+            apt-get update && apt-get install -y --no-install-recommends unzip libzip-dev libsqlite3-dev \
+            && docker-php-ext-install zip pcntl \
+            && pecl install pcov && docker-php-ext-enable pcov \
+            && curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer \
+            && composer install --no-interaction --prefer-dist \
+            && vendor/bin/pint --test \
+            && vendor/bin/phpstan analyse --no-progress --memory-limit=512M \
+            && cp .env.example .env \
+            && php artisan key:generate \
+            && php -d memory_limit=512M artisan test --coverage --min=90 ; \
+            EXIT_CODE=\$? ; \
+            chown -R ${HOST_UID}:${HOST_GID} /app ; \
+            exit \$EXIT_CODE
+          "
+        displayName: 'Pint + PHPStan + Pest (PHP 8.3 container)'
+
+  - job: Repository
+    workspace:
+      clean: all
+    steps:
+      - checkout: DevOps_CI
+      - script: |
+          pip install boto3
+          python3 manifests/bucket.py $(APP_SLUG)
+        displayName: Repository Create
+        env:
+          AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+          AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+          AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+  - job: Build
+    dependsOn:
+      - QualityChecks
+      - Repository
+    steps:
+      - checkout: self
+
+      - task: Docker@2
+        inputs:
+          containerRegistry: 'AWS ECR'
+          repository: '$(APP_SLUG)'
+          command: 'build'
+          Dockerfile: '**/Dockerfile'
+          tags: '$(env)-$(Build.BuildId)'
+          arguments: '--build-arg environment=$(profile)'
+
+      - task: ECRPushImage@1
+        inputs:
+          awsCredentials: 'AWS-ECR'
+          regionName: 'sa-east-1'
+          imageSource: 'imagename'
+          sourceImageName: '942839876831.dkr.ecr.sa-east-1.amazonaws.com/$(APP_SLUG)'
+          sourceImageTag: '$(env)-$(Build.BuildId)'
+          repositoryName: '$(APP_SLUG)'
+          pushTag: '$(env)-$(Build.BuildId)'
+
+      - task: trivy@1
+        displayName: Scan ECR Image
+        inputs:
+          version: '0.58.1'
+          image: '942839876831.dkr.ecr.sa-east-1.amazonaws.com/$(APP_SLUG):$(env)-$(Build.BuildId)'
+          docker: true
+          severities: 'CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN'
+          debug: true
+          exitCode: '0'
+
+  - job: Deploy
+    workspace:
+      clean: all
+    dependsOn: Build
+    steps:
+      - checkout: DevOps_CI
+      - script: |
+          python -m pip install --upgrade pip
+          pip install requests
+          python3 manifests/generate.py $(APP_SLUG) $(DOMAIN) $(APP_SLUG):$(env)-$(Build.BuildId) $(NAMESPACE) $(env) > $(System.DefaultWorkingDirectory)/$(APP_SLUG).yml
+          cat $(System.DefaultWorkingDirectory)/$(APP_SLUG).yml
+        displayName: Deploy Create
+      - task: Bash@3
+        displayName: 'Deploy'
+        inputs:
+          targetType: 'inline'
+          script: |
+            git config --global credential.helper "store --file ~/.git-credentials"
+            echo "https://fsbr:$(GITHUBPAT)@dev.azure.com" >> ~/.git-credentials
+            git config --global user.email "emerson.almeida@fsbrcorp.com.br"
+            git config --global user.name "Emerson Rocha"
+            git fetch --all
+            git checkout main || git checkout -b main origin/main
+            git pull origin main
+            BASE_DIR="Scripts/projects"
+            APP_DIR="${BASE_DIR}/$(APP_SLUG)"
+            SRC_FILE="$(System.DefaultWorkingDirectory)/$(APP_SLUG).yml"
+            DEST_FILE="${APP_DIR}/$(APP_SLUG)-$(env).yml"
+
+            if [ ! -d "$APP_DIR" ]; then
+              echo "Creating directory $APP_DIR"
+              mkdir -p $APP_DIR
+            fi
+
+            cp $SRC_FILE $DEST_FILE
+
+            git add $DEST_FILE
+            git commit -m "Update $(APP_SLUG).yml for environment $(env)"
+
+            git push origin main

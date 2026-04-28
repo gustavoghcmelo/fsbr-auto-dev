@@ -1,0 +1,16 @@
+version: '3.7'
+services:
+    fsbr-auto-dev-backend:
+        build:
+          context: .
+          args:
+              environment: dev
+        image: fsbr-auto-dev
+        container_name: fsbr-auto-dev-app
+        ports:
+            - '55501:80'
+        networks:
+            - fsbr-auto-dev
+networks:
+    fsbr-auto-dev:
+        driver: bridge
