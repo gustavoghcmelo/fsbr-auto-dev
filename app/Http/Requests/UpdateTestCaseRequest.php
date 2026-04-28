@@ -1,0 +1,35 @@
+<?php
+
+namespace App\Http\Requests;
+
+use App\Enums\TestCasePriority;
+use App\Enums\TestCaseStatus;
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
+
+class UpdateTestCaseRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return $this->user()->can('update', $this->route('case'));
+    }
+
+    /**
+     * @return array<string, array<int, mixed>|string>
+     */
+    public function rules(): array
+    {
+        return [
+            'title' => ['required', 'string', 'max:255'],
+            'preconditions' => ['nullable', 'string'],
+            'steps' => ['array'],
+            'steps.*.keyword' => ['required', 'string', 'max:40'],
+            'steps.*.text' => ['required', 'string'],
+            'steps.*.type' => ['required', Rule::in(['precondition', 'action', 'assertion'])],
+            'expected_result' => ['nullable', 'string'],
+            'gherkin' => ['nullable', 'string'],
+            'priority' => ['required', Rule::enum(TestCasePriority::class)],
+            'status' => ['required', Rule::enum(TestCaseStatus::class)],
+        ];
+    }
+}
